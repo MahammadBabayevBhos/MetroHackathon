@@ -1,75 +1,66 @@
-import streamlit as st
+from collections import deque
+import os
+import time
+from typing import Dict, Tuple
+
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import streamlit as st
 import supervision as sv
-import time
-from collections import deque
+from ultralytics import YOLO
 
-# ─────────────────────────────────────────────
-# Konfiqurasiya
-# ─────────────────────────────────────────────
-VIDEO_PATHS = {
-    "Vaqon 1": r"C:\Users\Lenovo\Downloads\В2-КАМ2_16-04-26_13-00-00.avi",
-    "Vaqon 2": r"C:\Users\Lenovo\Downloads\В4-КАМ6_60042_16-04-26_18-00-00.avi",
-    "Vaqon 3": r"C:\Users\Lenovo\Downloads\В2-КАМ4_16-04-26_13-00-00.avi",
-    "Vaqon 4": r"C:\Users\Lenovo\Downloads\В2-КАМ6_16-04-26_13-00-00.avi",
-    "Vaqon 5": r"C:\Users\Lenovo\Downloads\В3-КАМ6_60053_16-04-26_08-20-00.avi"
-}
+from config import (
+    CALIBRATION_SEC,
+    CHANGE_THRESHOLD,
+    DEFAULT_CONFIDENCE,
+    DEFAULT_IMGSZ,
+    DEFAULT_IOU,
+    DEFAULT_MODEL_NANO,
+    DEFAULT_WAGON_VIDEOS,
+    FPS_DEFAULT,
+    SMOOTH_BUF_SIZE,
+    THRESHOLD_CROWDED_MAX,
+    THRESHOLD_NORMAL_MAX,
+    VAGON_POLY,
+)
 
-VAGON_POLY = np.array([
-    [160,   20],
-    [1120,  20],
-    [1280, 720],
-    [0,    720],
-])
+st.set_page_config(page_title="Baki Metrosu: Vaqon Sixligi Monitorinqi", layout="wide")
 
-FPS                = 30
-CALIBRATION_SEC    = 10
-CALIBRATION_FRAMES = (FPS * CALIBRATION_SEC) // 3  # hər 3 frame-dən 1-i
-CHANGE_THRESHOLD   = 3
-SMOOTH_BUF_SIZE    = 15
-
-def sixliq(n):
-    if n <= 12:
+def evaluate_density(n: int) -> Tuple[str, str, int]:
+    if n <= THRESHOLD_NORMAL_MAX:
         return "NORMAL", "#2ecc40", 0
-    elif n <= 20:
+    elif n <= THRESHOLD_CROWDED_MAX:
         return "SIX", "#ff851b", 1
     else:
         return "COX SIX", "#ff4136", 2
 
-# ─────────────────────────────────────────────
-# Session state
-# ─────────────────────────────────────────────
-def init_state():
+
+def init_state(video_sources: Dict[str, str]):
     defaults = {
         "running": False,
-        "results": {name: {"count": 0, "level": 0, "color": "#2ecc40", "label": "NORMAL"} for name in VIDEO_PATHS},
+        "results": {name: {"count": 0, "level": 0, "color": "#2ecc40", "label": "NORMAL"} for name in video_sources},
         "yolo_model": None,
-        "smooth_bufs": {name: deque(maxlen=SMOOTH_BUF_SIZE) for name in VIDEO_PATHS},
-        "calib_bufs": {name: [] for name in VIDEO_PATHS},
-        "peaks": {name: 0 for name in VIDEO_PATHS},
-        "display_vals": {name: 0 for name in VIDEO_PATHS},
-        "calibrated": {name: False for name in VIDEO_PATHS},
-        "frame_counters": {name: 0 for name in VIDEO_PATHS},
+        "smooth_bufs": {name: deque(maxlen=SMOOTH_BUF_SIZE) for name in video_sources},
+        "calib_bufs": {name: [] for name in video_sources},
+        "peaks": {name: 0 for name in video_sources},
+        "display_vals": {name: 0 for name in video_sources},
+        "calibrated": {name: False for name in video_sources},
+        "frame_counters": {name: 0 for name in video_sources},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-init_state()
 
-def reset_state():
-    st.session_state.smooth_bufs    = {name: deque(maxlen=SMOOTH_BUF_SIZE) for name in VIDEO_PATHS}
-    st.session_state.calib_bufs     = {name: [] for name in VIDEO_PATHS}
-    st.session_state.peaks          = {name: 0 for name in VIDEO_PATHS}
-    st.session_state.display_vals   = {name: 0 for name in VIDEO_PATHS}
-    st.session_state.calibrated     = {name: False for name in VIDEO_PATHS}
-    st.session_state.frame_counters = {name: 0 for name in VIDEO_PATHS}
+def reset_state(video_sources: Dict[str, str]):
+    st.session_state.smooth_bufs = {name: deque(maxlen=SMOOTH_BUF_SIZE) for name in video_sources}
+    st.session_state.calib_bufs = {name: [] for name in video_sources}
+    st.session_state.peaks = {name: 0 for name in video_sources}
+    st.session_state.display_vals = {name: 0 for name in video_sources}
+    st.session_state.calibrated = {name: False for name in video_sources}
+    st.session_state.frame_counters = {name: 0 for name in video_sources}
 
-# ─────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
@@ -123,7 +114,7 @@ st.markdown("""
     display: flex; flex-wrap: wrap; justify-content: center;
     align-content: flex-start; gap: 3px; width: 100%; min-height: 80px;
 }
-.person-icon { font-size: 17px; line-height: 1; }
+.person-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin: 1px; }
 .wagon-count { font-family: 'Orbitron', sans-serif; font-size: 32px; font-weight: 900; line-height: 1; }
 .wagon-count.green  { color:#2ecc40; text-shadow:0 0 12px rgba(46,204,64,.7); }
 .wagon-count.orange { color:#ff851b; text-shadow:0 0 12px rgba(255,133,27,.7); }
@@ -147,62 +138,64 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Header
-# ─────────────────────────────────────────────
-st.markdown('<p class="main-title"> BAKI METROSU</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">Vaqon Yükləmə Monitorinqi · Real-time</p>', unsafe_allow_html=True)
-st.markdown("""
+st.sidebar.header("Sistem Parametrleri")
+model_choice = st.sidebar.selectbox("Model:", [DEFAULT_MODEL_NANO, "yolov8s.pt", "yolov8m.pt"], index=0)
+conf_threshold = st.sidebar.slider("Confidence Heddi:", 0.1, 0.9, DEFAULT_CONFIDENCE, 0.05)
+
+video_sources = {}
+st.sidebar.subheader("Video Menbeleri:")
+for name, default_path in DEFAULT_WAGON_VIDEOS.items():
+    custom_path = st.sidebar.text_input(f"{name} Yolu:", value=default_path)
+    video_sources[name] = custom_path
+
+init_state(video_sources)
+
+st.markdown('<p class="main-title">BAKI METROSU</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">Vaqon Yukleme Monitorinqi : Real-Time Analiz</p>', unsafe_allow_html=True)
+st.markdown(f"""
 <div class="legend-bar">
-  <div class="legend-item"><div class="legend-dot" style="background:#2ecc40"></div>0–10 · NORMAL</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#ff851b"></div>11–20 · SIX</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#ff4136"></div>&gt;20 · COX SIX</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#2ecc40"></div>0:{THRESHOLD_NORMAL_MAX} : NORMAL</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ff851b"></div>{THRESHOLD_NORMAL_MAX + 1}:{THRESHOLD_CROWDED_MAX} : SIX</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ff4136"></div>>{THRESHOLD_CROWDED_MAX} : COX SIX</div>
 </div>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Buttons
-# ─────────────────────────────────────────────
-c1, c2, c3 = st.columns([1, 2, 1])
-with c2:
-    if st.button("▶  Monitorinqi Başlat", use_container_width=True, type="primary"):
-        reset_state()
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    if st.button("Monitorinqi Baslat", use_container_width=True, type="primary"):
+        reset_state(video_sources)
         st.session_state.running = True
-    if st.button("⏹  Dayandır", use_container_width=True):
+    if st.button("Dayandir", use_container_width=True):
         st.session_state.running = False
 
-calib_ph  = st.empty()
-wagon_ph  = st.empty()
+calib_ph = st.empty()
+wagon_ph = st.empty()
 status_ph = st.empty()
 
-# ─────────────────────────────────────────────
-# Render — KALİBRASİYA yazısı yoxdur
-# ─────────────────────────────────────────────
-def render_wagons(results, calibrated_map):
+
+def render_wagons(results, calibrated_map) -> str:
     cc_map = ["green", "orange", "red"]
 
-    def make_icons(count, cc):
-        c = {"green":"#2ecc40","orange":"#ff851b","red":"#ff4136","calib":"#00d4ff"}[cc]
-        n = min(count, 12)
-        html = "".join(f'<span class="person-icon" style="color:{c}">👤</span>' for _ in range(n))
+    def make_indicators(count: int, color_hex: str) -> str:
+        num = min(count, 12)
+        html = "".join(f'<span class="person-indicator" style="background:{color_hex}"></span>' for _ in range(num))
         if count > 12:
-            html += f'<span style="color:{c};font-size:11px;font-weight:bold">+{count-12}</span>'
+            html += f'<span style="color:{color_hex};font-size:11px;font-weight:bold">+{count-12}</span>'
         return html
 
     html = '<div class="wagon-grid">'
     for i, (name, d) in enumerate(results.items(), 1):
         is_calib = not calibrated_map.get(name, False)
-        cc       = "calib" if is_calib else cc_map[d["level"]]
-
-        # FIX 2: KALİBRASİYA yazısı yoxdur — həmişə normal label
+        cc = "calib" if is_calib else cc_map[d["level"]]
+        color_hex = {"green": "#2ecc40", "orange": "#ff851b", "red": "#ff4136", "calib": "#00d4ff"}[cc]
         status_txt = d["label"]
 
         html += f"""
         <div class="wagon-card">
           <div class="wagon-label">{name.upper()}</div>
           <div class="wagon-body {cc}">
-            <div class="person-icons">{make_icons(d["count"], cc)}</div>
-            <div class="wagon-count {cc}">{d["count"]}</div>
+            <div class="person-icons">{make_indicators(d['count'], color_hex)}</div>
+            <div class="wagon-count {cc}">{d['count']}</div>
             <div class="wagon-status {cc}">{status_txt}</div>
           </div>
           <div class="wagon-bottom"></div>
@@ -211,123 +204,123 @@ def render_wagons(results, calibrated_map):
     html += "</div>"
     return html
 
+
 wagon_ph.markdown(render_wagons(st.session_state.results, st.session_state.calibrated), unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Smart Peak-Hold — frame_counters burada artmır
-# ─────────────────────────────────────────────
-def smart_count(name, raw):
+
+def smart_count(name: str, raw: int, calib_frames: int) -> int:
     fc = st.session_state.frame_counters[name]
-
     st.session_state.smooth_bufs[name].append(raw)
-    smoothed = round(sum(st.session_state.smooth_bufs[name]) /
-                     len(st.session_state.smooth_bufs[name]))
+    smoothed = round(sum(st.session_state.smooth_bufs[name]) / len(st.session_state.smooth_bufs[name]))
 
-    if fc < CALIBRATION_FRAMES:
+    if fc < calib_frames:
         st.session_state.calib_bufs[name].append(smoothed)
-        # FIX 3: kalibrasiya zamanı ədədi dəyişdirmə — 0 göstər
-        result = 0
+        return 0
     else:
         if not st.session_state.calibrated[name]:
             peak = max(st.session_state.calib_bufs[name]) if st.session_state.calib_bufs[name] else smoothed
-            st.session_state.peaks[name]        = peak
+            st.session_state.peaks[name] = peak
             st.session_state.display_vals[name] = peak
-            st.session_state.calibrated[name]   = True
+            st.session_state.calibrated[name] = True
 
         current = st.session_state.display_vals[name]
-        delta   = smoothed - current
+        delta = smoothed - current
 
         if delta >= CHANGE_THRESHOLD:
             st.session_state.display_vals[name] = smoothed
-            st.session_state.peaks[name]        = smoothed
+            st.session_state.peaks[name] = smoothed
         elif delta <= -CHANGE_THRESHOLD:
             st.session_state.display_vals[name] = max(0, current - 1)
 
-        result = st.session_state.display_vals[name]
+        return st.session_state.display_vals[name]
 
-    return result
 
-# ─────────────────────────────────────────────
-# Main loop
-# ─────────────────────────────────────────────
 if st.session_state.running:
-
     if st.session_state.yolo_model is None:
-        with st.spinner("YOLOv8 modeli yüklənir..."):
-            st.session_state.yolo_model = YOLO("yolov8m.pt")
+        with st.spinner("YOLO modeli yuklenir..."):
+            st.session_state.yolo_model = YOLO(model_choice)
     model = st.session_state.yolo_model
 
-    caps     = {}
+    caps = {}
     trackers = {}
-    zones    = {}
+    zones = {}
 
-    for name, path in VIDEO_PATHS.items():
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            st.warning(f"⚠ Aça bilmədim: {path}")
-            continue
-        caps[name]     = cap
-        trackers[name] = sv.ByteTrack(lost_track_buffer=60, frame_rate=30)
-        zones[name]    = sv.PolygonZone(polygon=VAGON_POLY)
+    for name, path in video_sources.items():
+        if os.path.exists(path):
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                caps[name] = cap
+                trackers[name] = sv.ByteTrack(lost_track_buffer=60, frame_rate=FPS_DEFAULT)
+                zones[name] = sv.PolygonZone(polygon=VAGON_POLY)
 
-    global_frame = 0
+    if not caps:
+        st.warning("Secilmis video fayllari tapilmadi. Zehmet olmasa yan panelden duzgun video yollarini qeyd edin.")
+        st.session_state.running = False
+    else:
+        calib_frames_total = (FPS_DEFAULT * CALIBRATION_SEC) // 3
+        global_frame = 0
 
-    while st.session_state.running:
-        for name, cap in caps.items():
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
-            if not ret:
-                continue
+        try:
+            while st.session_state.running:
+                for name, cap in caps.items():
+                    ret, frame = cap.read()
+                    if not ret:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                    if not ret:
+                        continue
 
-            # FIX 1: frame_counters ƏVVƏLCƏ artır
-            st.session_state.frame_counters[name] += 1
+                    st.session_state.frame_counters[name] += 1
+                    if st.session_state.frame_counters[name] % 3 != 0:
+                        continue
 
-            # Sonra yoxla — bu frame-i işləyəkmi?
-            if st.session_state.frame_counters[name] % 3 != 0:
-                continue
+                    res = model(
+                        frame,
+                        classes=[0],
+                        conf=conf_threshold,
+                        iou=DEFAULT_IOU,
+                        imgsz=DEFAULT_IMGSZ,
+                        verbose=False
+                    )[0]
+                    dets = sv.Detections.from_ultralytics(res)
+                    dets = trackers[name].update_with_detections(dets)
+                    mask = zones[name].trigger(detections=dets)
+                    raw = len(dets[mask])
 
-            res  = model(frame, classes=[0], conf=0.25, iou=0.45, imgsz=640, verbose=False)[0]
-            dets = sv.Detections.from_ultralytics(res)
-            dets = trackers[name].update_with_detections(dets)
-            mask = zones[name].trigger(detections=dets)
-            raw  = len(dets[mask])
+                    count = smart_count(name, raw, calib_frames_total)
+                    label, color, level = evaluate_density(count)
 
-            count = smart_count(name, raw)
-            label, color, level = sixliq(count)
+                    st.session_state.results[name] = {
+                        "count": count,
+                        "level": level,
+                        "color": color,
+                        "label": label,
+                    }
 
-            st.session_state.results[name] = {
-                "count": count, "level": level,
-                "color": color, "label": label,
-            }
+                done_count = sum(1 for v in st.session_state.calibrated.values() if v)
+                total_v = len(caps)
+                if done_count < total_v:
+                    calib_ph.markdown(
+                        f'<div class="calib-bar">KALIBRASIYA: {done_count}/{total_v} : {CALIBRATION_SEC} saniye gozleyin...</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    calib_ph.empty()
 
-        # Kalibrasiya status barı
-        done_count = sum(1 for v in st.session_state.calibrated.values() if v)
-        total_v    = len(VIDEO_PATHS)
-        if done_count < total_v:
-            calib_ph.markdown(
-                f'<div class="calib-bar"> KALİBRASİYA: {done_count}/{total_v} · {CALIBRATION_SEC} saniyə gözləyin...</div>',
-                unsafe_allow_html=True
-            )
-        else:
-            calib_ph.empty()  # FIX 4: kalibrasiya bitəndə bar tamamilə yox olur
+                wagon_ph.markdown(
+                    render_wagons(st.session_state.results, st.session_state.calibrated),
+                    unsafe_allow_html=True
+                )
 
-        wagon_ph.markdown(
-            render_wagons(st.session_state.results, st.session_state.calibrated),
-            unsafe_allow_html=True
-        )
+                total_p = sum(v["count"] for v in st.session_state.results.values())
+                status_ph.markdown(
+                    f'<div class="status-bar">Kadr #{global_frame} : Umumi: {total_p} sernisin aktiv</div>',
+                    unsafe_allow_html=True
+                )
 
-        total = sum(v["count"] for v in st.session_state.results.values())
-        status_ph.markdown(
-            f'<div class="status-bar">● Frame #{global_frame} · Ümumi: {total} sərnişin aktiv</div>',
-            unsafe_allow_html=True
-        )
-
-        global_frame += 1
-        time.sleep(0.05)
-
-    for cap in caps.values():
-        cap.release()
-
-    status_ph.markdown('<div class="status-bar">⏹ Monitorinq dayandırıldı</div>', unsafe_allow_html=True)
+                global_frame += 1
+                time.sleep(0.04)
+        finally:
+            for cap in caps.values():
+                cap.release()
+            status_ph.markdown('<div class="status-bar">Monitorinq dayandirildi</div>', unsafe_allow_html=True)

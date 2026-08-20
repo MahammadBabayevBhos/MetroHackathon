@@ -1,73 +1,96 @@
+import argparse
+import os
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import supervision as sv
+from ultralytics import YOLO
 
-VIDEO_PATH = r"C:\Users\Lenovo\Downloads\В4-КАМ6_60042_16-04-26_18-00-00.avi"
+from config import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_IMGSZ,
+    DEFAULT_IOU,
+    DEFAULT_MODEL_MEDIUM,
+    THRESHOLD_CROWDED_MAX,
+    THRESHOLD_NORMAL_MAX,
+    VAGON_POLY,
+)
 
-video_info = sv.VideoInfo.from_video_path(VIDEO_PATH)
-W, H = video_info.resolution_wh
 
-model   = YOLO("yolov8m.pt")
-tracker = sv.ByteTrack(lost_track_buffer=60, frame_rate=30)
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Baki Metrosu: Tek Vaqon Analizi")
+    parser.add_argument("--video", type=str, default="data/vagon_sample.avi", help="Vaqon video faylinin yolu")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL_MEDIUM, help="YOLO model cekisi")
+    return parser.parse_args()
 
-# ── Yalnız vaqon zone ──────────────────────────────────
-VAGON_POLY = np.array([
-    [160,   20],
-    [1120,  20],
-    [1280, 720],
-    [0,    720],
-])
 
-zone      = sv.PolygonZone(polygon=VAGON_POLY)
-zone_ann  = sv.PolygonZoneAnnotator(zone=zone, color=sv.Color.YELLOW, thickness=2)
-box_ann   = sv.BoxAnnotator(thickness=2)
-label_ann = sv.LabelAnnotator(text_scale=0.45)
+def evaluate_density(n: int):
+    if n <= THRESHOLD_NORMAL_MAX:
+        return "NORMAL", (0, 200, 0)
+    if n <= THRESHOLD_CROWDED_MAX:
+        return "SIX", (0, 165, 255)
+    return "COX SIX", (0, 0, 220)
 
-def sixliq(n):
-    if n <= 15:  return "NORMAL",    (0, 200, 0)
-    if n <= 20:  return "SIX",     (0, 165, 255)
-    return           "COX SIX",    (0, 0, 220)
 
-cap = cv2.VideoCapture(VIDEO_PATH)
+def main():
+    args = parse_arguments()
+    if not os.path.exists(args.video):
+        print(f"Xeta: Video fayli tapilmadi: {args.video}")
+        print("Gosteris: --video parametri ile video faylin yolunu qeyd edin.")
+        return
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+    model = YOLO(args.model)
+    tracker = sv.ByteTrack(lost_track_buffer=60, frame_rate=30)
+    zone = sv.PolygonZone(polygon=VAGON_POLY)
 
-    results    = model(frame, classes=[0], conf=0.25,
-                       iou=0.45, imgsz=640, verbose=False)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    detections = tracker.update_with_detections(detections)
+    zone_ann = sv.PolygonZoneAnnotator(zone=zone, color=sv.Color.YELLOW, thickness=2)
+    box_ann = sv.BoxAnnotator(thickness=2)
+    label_ann = sv.LabelAnnotator(text_scale=0.45)
 
-    # Yalnız zone içindəkilər
-    mask       = zone.trigger(detections=detections)
-    det_zone   = detections[mask]
+    cap = cv2.VideoCapture(args.video)
 
-    anliq      = len(det_zone)
-    signal, color = sixliq(anliq)
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    labels     = [f"#{tid}" for tid in det_zone.tracker_id] \
-                 if det_zone.tracker_id is not None else []
+            results = model(
+                frame,
+                classes=[0],
+                conf=DEFAULT_CONFIDENCE,
+                iou=DEFAULT_IOU,
+                imgsz=DEFAULT_IMGSZ,
+                verbose=False
+            )[0]
 
-    annotated  = box_ann.annotate(frame.copy(), det_zone)
-    annotated  = label_ann.annotate(annotated, det_zone, labels=labels)
-    annotated  = zone_ann.annotate(annotated)
+            detections = sv.Detections.from_ultralytics(results)
+            detections = tracker.update_with_detections(detections)
 
-    # Dashboard
-    overlay = annotated.copy()
-    cv2.rectangle(overlay, (10, 10), (350, 130), (0,0,0), -1)
-    cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
+            mask = zone.trigger(detections=detections)
+            det_zone = detections[mask]
+            count = len(det_zone)
+            signal, color = evaluate_density(count)
 
-    cv2.putText(annotated, f"Vaqonda adam: {anliq}",
-                (20, 60),  cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0,255,0), 3)
-    cv2.putText(annotated, signal,
-                (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+            labels = [f"#{tid}" for tid in det_zone.tracker_id] if det_zone.tracker_id is not None else []
 
-    cv2.imshow("Baki Metrosu - PlatformAI", annotated)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+            annotated = box_ann.annotate(frame.copy(), det_zone)
+            annotated = label_ann.annotate(annotated, det_zone, labels=labels)
+            annotated = zone_ann.annotate(annotated)
 
-cap.release()
-cv2.destroyAllWindows()
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (10, 10), (350, 130), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
+
+            cv2.putText(annotated, f"Vaqonda adam: {count}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 3)
+            cv2.putText(annotated, signal, (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+
+            cv2.imshow("Baki Metrosu: Vaqon Analizi", annotated)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

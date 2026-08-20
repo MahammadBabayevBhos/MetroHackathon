@@ -1,100 +1,151 @@
-import cv2
-import numpy as np
-from ultralytics import YOLO
-import supervision as sv
+import argparse
+import os
+import sys
 from collections import defaultdict, deque
+from typing import Set
 
-VIDEO_PATH = r"C:\Users\Lenovo\Downloads\Cixanlar_3.mp4"
+import cv2
+import supervision as sv
+from ultralytics import YOLO
 
-video_info = sv.VideoInfo.from_video_path(VIDEO_PATH)
-W, H = video_info.resolution_wh
+from config import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_EXIT_VIDEO,
+    DEFAULT_IMGSZ,
+    DEFAULT_IOU,
+    DEFAULT_MODEL_NANO,
+    LINE_END_POINT,
+    LINE_START_POINT,
+)
 
-model   = YOLO("yolov8n.pt")
-tracker = sv.ByteTrack(lost_track_buffer=90, frame_rate=30)
 
-box_ann   = sv.BoxAnnotator(thickness=2)
-label_ann = sv.LabelAnnotator(text_scale=0.45)
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Baki Metrosu: Agilli Cixis Saygaci")
+    parser.add_argument("--video", type=str, default=DEFAULT_EXIT_VIDEO, help="Giris video faylinin yolu")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL_NANO, help="YOLO model cekisi")
+    parser.add_argument("--conf", type=float, default=DEFAULT_CONFIDENCE, help="Confidence heddi")
+    parser.add_argument("--iou", type=float, default=DEFAULT_IOU, help="IoU heddi")
+    parser.add_argument("--hide-view", action="store_true", help="OpenCV goruntusunu gizletmek ucun")
+    return parser.parse_args()
 
-#  Şaquli xətt
-LINE_START = sv.Point(393, 50)
-LINE_END   = sv.Point(415, 475)
 
-line     = sv.LineZone(start=LINE_START, end=LINE_END)
-line_ann = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=0.7)
+def run_exit_counter(video_path: str, model_path: str, conf: float, iou: float, show_view: bool = True) -> int:
+    if not os.path.exists(video_path):
+        print(f"Xeta: Video fayli tapilmadi: {video_path}")
+        print("Gosteris: --video parametri ile movcud video faylin yolunu qeyd edin.")
+        return 0
 
-# ── Blacklist məntiqi
-# Soldan sağa keçən ID → ödəniş üçün girdi → blacklist
-# Sağdan sola keçən ID → əgər blacklist-dədirsə SAYMA, yoxdursa SAY
+    video_info = sv.VideoInfo.from_video_path(video_path)
+    model = YOLO(model_path)
+    tracker = sv.ByteTrack(lost_track_buffer=90, frame_rate=int(video_info.fps) if video_info.fps > 0 else 30)
 
-blacklist_ids = set()  # ödəniş üçün girənlər
-cixan_sayi   = 0
+    box_annotator = sv.BoxAnnotator(thickness=2)
+    label_annotator = sv.LabelAnnotator(text_scale=0.45)
 
-# Hər ID-nin əvvəlki X mərkəzi
-cx_history = defaultdict(lambda: deque(maxlen=5))
+    line_start = sv.Point(LINE_START_POINT[0], LINE_START_POINT[1])
+    line_end = sv.Point(LINE_END_POINT[0], LINE_END_POINT[1])
+    line_zone = sv.LineZone(start=line_start, end=line_end)
+    line_annotator = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=0.7)
 
-cap = cv2.VideoCapture(VIDEO_PATH)
+    blacklist_ids: Set[int] = set()
+    cixan_sayi = 0
+    cx_history = defaultdict(lambda: deque(maxlen=10))
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+    cap = cv2.VideoCapture(video_path)
 
-    results    = model(frame, classes=[0], conf=0.3,
-                       iou=0.45, imgsz=640, verbose=False)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    detections = tracker.update_with_detections(detections)
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    # LineZone keçidləri izlə
-    crossed_in, crossed_out = line.trigger(detections=detections)
+            results = model(
+                frame,
+                classes=[0],
+                conf=conf,
+                iou=iou,
+                imgsz=DEFAULT_IMGSZ,
+                verbose=False
+            )[0]
 
-    if detections.tracker_id is not None:
-        for i, tid in enumerate(detections.tracker_id):
-            x1, y1, x2, y2 = detections.xyxy[i]
-            cx = int((x1 + x2) / 2)
-            cx_history[tid].append(cx)
+            detections = sv.Detections.from_ultralytics(results)
+            detections = tracker.update_with_detections(detections)
 
-        # crossed_in → soldan sağa (ödəniş üçün girdi) → blacklist
-        for i, is_crossed in enumerate(crossed_in):
-            if is_crossed and detections.tracker_id is not None:
-                tid = detections.tracker_id[i]
-                blacklist_ids.add(tid)
+            crossed_in, crossed_out = line_zone.trigger(detections=detections)
 
-        # crossed_out → sağdan sola (çıxır)
-        for i, is_crossed in enumerate(crossed_out):
-            if is_crossed and detections.tracker_id is not None:
-                tid = detections.tracker_id[i]
-                if tid in blacklist_ids:
-                    # Ödəniş edib qayıdan → SAYMA
-                    blacklist_ids.discard(tid)
-                else:
-                    # Metro çıxan → SAY
-                    cixan_sayi += 1
+            if detections.tracker_id is not None:
+                for i, tid in enumerate(detections.tracker_id):
+                    x1, _, x2, _ = detections.xyxy[i]
+                    cx = int((x1 + x2) / 2)
+                    cx_history[tid].append(cx)
 
-    # ── Vizuallaşdırma ────────────────────────────────
-    labels = []
-    if detections.tracker_id is not None:
-        for tid in detections.tracker_id:
-            tag = "[OD]" if tid in blacklist_ids else "[CX]"
-            labels.append(f"{tag}#{tid}")
+                # Soldan saga kecid (Odenis zonasina daxil olma : Blacklist)
+                for i, is_crossed in enumerate(crossed_in):
+                    if is_crossed and detections.tracker_id is not None:
+                        tid = int(detections.tracker_id[i])
+                        blacklist_ids.add(tid)
 
-    annotated = box_ann.annotate(frame.copy(), detections)
-    annotated = label_ann.annotate(annotated, detections, labels=labels)
-    annotated = line_ann.annotate(annotated, line_counter=line)
+                # Sagdan sola kecid (Metrodan cixis)
+                for i, is_crossed in enumerate(crossed_out):
+                    if is_crossed and detections.tracker_id is not None:
+                        tid = int(detections.tracker_id[i])
+                        if tid in blacklist_ids:
+                            blacklist_ids.discard(tid)
+                        else:
+                            cixan_sayi += 1
 
-    # Dashboard
-    overlay = annotated.copy()
-    cv2.rectangle(overlay, (10, 10), (420, 110), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0, annotated)
+            if show_view:
+                labels = []
+                if detections.tracker_id is not None:
+                    for tid in detections.tracker_id:
+                        tag = "[OD]" if int(tid) in blacklist_ids else "[CX]"
+                        labels.append(f"{tag}#{tid}")
 
-    cv2.putText(annotated, f"Metro cixan: {cixan_sayi}",
-                (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 255, 100), 3)
-    cv2.putText(annotated, f"Blacklist: {len(blacklist_ids)} nefer",
-                (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
+                annotated = box_annotator.annotate(frame.copy(), detections)
+                annotated = label_annotator.annotate(annotated, detections, labels=labels)
+                annotated = line_annotator.annotate(annotated, line_counter=line_zone)
 
-    cv2.imshow("Baki Metrosu - Metro Cixis Sayaci", annotated)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+                overlay = annotated.copy()
+                cv2.rectangle(overlay, (10, 10), (420, 110), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0, annotated)
 
-cap.release()
-cv2.destroyAllWindows()
-print(f"\nYekun — Metro cixan: {cixan_sayi}")
+                cv2.putText(
+                    annotated,
+                    f"Metro cixan: {cixan_sayi}",
+                    (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.3,
+                    (0, 255, 100),
+                    3
+                )
+                cv2.putText(
+                    annotated,
+                    f"Blacklist: {len(blacklist_ids)} nefer",
+                    (20, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 100, 255),
+                    2
+                )
+
+                cv2.imshow("Baki Metrosu: Cixis Saygaci", annotated)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    finally:
+        cap.release()
+        if show_view:
+            cv2.destroyAllWindows()
+
+    print(f"Netice: Metro cixan sernisin sayi: {cixan_sayi}")
+    return cixan_sayi
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    run_exit_counter(
+        video_path=args.video,
+        model_path=args.model,
+        conf=args.conf,
+        iou=args.iou,
+        show_view=not args.hide_view
+    )
